@@ -1,21 +1,53 @@
 import hashlib
 import json
-import os
-import numpy as np
+import math
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Dict, List, Optional, Tuple
-from PIL import Image, ImageOps, ImageSequence, ExifTags
-import torch
 
 import folder_paths
 import nodes
+
+import os
+import numpy as np
+from PIL import Image, ImageOps, ImageSequence, ExifTags
+import torch
 import node_helpers
 
-
-_STATE_VERSION = 1
+_STATE_VERSION = 2
+_MAX_IMAGES_PER_EXECUTION = 9
+_REFERENCE_SLOT_COUNT = 8
+_REFERENCE_OUTPUT_SLOTS_KEY = "reference_output_slots"
+_QUEUE_OUTPUT_SLOTS_KEY = "queue_output_slots"
+_QUEUE_SLOT_IMAGE = 0
+_QUEUE_SLOT_LAST_FRAME = 1
+_MAIN_OUTPUT_ENABLED_KEY = "main_output_enabled"
+_OUTPUT_MODE_PERSISTENT = "persistent_refs"
+_OUTPUT_MODE_QUEUE_GROUP = "queue_group"
+_SUPPORTED_IMAGE_EXTENSIONS = {
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".bmp",
+    ".gif",
+    ".tif",
+    ".tiff",
+    ".avif",
+}
 
 
 def _deep_copy_json(value: Any) -> Any:
     return json.loads(json.dumps(value))
+
+
+def _normalize_images_per_execution(value: Any) -> int:
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 1
+    if not math.isfinite(number):
+        return 1
+    return max(1, min(_MAX_IMAGES_PER_EXECUTION, int(number)))
 
 
 def _default_state() -> Dict[str, Any]:
@@ -25,18 +57,22 @@ def _default_state() -> Dict[str, Any]:
         "auto_queue": False,
         "dont_consume": False,
         "catch_canvas_drops": False,
+        "images_per_execution": 1,
+        "output_mode": _OUTPUT_MODE_PERSISTENT,
+        "reference_slots": [None] * _REFERENCE_SLOT_COUNT,
+        "active_reference_preset_id": "",
     }
 
 
 def _default_ui_state() -> Dict[str, Any]:
     """
     Return the default persisted UI state used by the node.
-    
+
     The returned state contains the schema version and the UI-specific fields tracked across sessions:
     - `version`: schema version forced to the module `_STATE_VERSION`.
     - `selected_ids`: list of selected item IDs (empty by default).
     - `source_paths`: mapping of `{item_id: path}` that can override an item's stored `source_path` at runtime.
-    
+
     Returns:
         ui_state (Dict[str, Any]): Default UI state with keys `version`, `selected_ids`, and `source_paths`.
     """
@@ -84,6 +120,59 @@ def _normalize_item(item: Any) -> Optional[Dict[str, Any]]:
     }
 
 
+def _normalize_reference_slot(value: Any) -> Optional[Dict[str, str]]:
+    if not isinstance(value, dict):
+        return None
+    annotated = str(value.get("annotated", "")).strip()
+    suffix = " [input]"
+    if not annotated.endswith(suffix):
+        return None
+    relative_path = annotated[: -len(suffix)].strip().replace("\\", "/")
+    posix = PurePosixPath(relative_path)
+    windows = PureWindowsPath(relative_path)
+    parts = relative_path.split("/")
+    if (
+        not relative_path
+        or posix.is_absolute()
+        or windows.is_absolute()
+        or windows.drive
+        or any(part in {"", ".", ".."} for part in parts)
+        or Path(relative_path).suffix.lower() not in _SUPPORTED_IMAGE_EXTENSIONS
+    ):
+        return None
+    storage_type = str(value.get("type", "input")).strip().lower() or "input"
+    if storage_type != "input":
+        return None
+    parent = "" if str(posix.parent) == "." else str(posix.parent)
+    return {
+        "annotated": f"{relative_path} [input]",
+        "filename": posix.name,
+        "subfolder": parent,
+        "type": "input",
+    }
+
+
+def _normalize_reference_slots(value: Any) -> List[Optional[Dict[str, str]]]:
+    source = value if isinstance(value, list) else []
+    return [
+        _normalize_reference_slot(source[index]) if index < len(source) else None
+        for index in range(_REFERENCE_SLOT_COUNT)
+    ]
+
+
+def _normalize_output_mode(state: Any, images_per_execution: int) -> str:
+    if isinstance(state, dict) and "output_mode" in state:
+        value = str(state.get("output_mode", "")).strip().lower()
+        if value == _OUTPUT_MODE_QUEUE_GROUP:
+            return _OUTPUT_MODE_QUEUE_GROUP
+        return _OUTPUT_MODE_PERSISTENT
+    return (
+        _OUTPUT_MODE_QUEUE_GROUP
+        if images_per_execution > 1
+        else _OUTPUT_MODE_PERSISTENT
+    )
+
+
 def _normalize_state(raw: Any) -> Dict[str, Any]:
     state = _safe_json_load(raw, _default_state())
     items_raw = state.get("items", []) if isinstance(state, dict) else []
@@ -93,22 +182,50 @@ def _normalize_state(raw: Any) -> Dict[str, Any]:
             normalized = _normalize_item(item)
             if normalized is not None:
                 items.append(normalized)
+    images_per_execution = _normalize_images_per_execution(
+        state.get("images_per_execution", 1) if isinstance(state, dict) else 1
+    )
+    output_mode = _normalize_output_mode(state, images_per_execution)
     return {
         "version": _STATE_VERSION,
         "items": items,
-        "auto_queue": bool(state.get("auto_queue", False)) if isinstance(state, dict) else False,
-        "dont_consume": bool(state.get("dont_consume", False)) if isinstance(state, dict) else False,
-        "catch_canvas_drops": bool(state.get("catch_canvas_drops", False)) if isinstance(state, dict) else False,
+        "auto_queue": (
+            bool(state.get("auto_queue", False)) if isinstance(state, dict) else False
+        ),
+        "dont_consume": (
+            bool(state.get("dont_consume", False)) if isinstance(state, dict) else False
+        ),
+        "catch_canvas_drops": (
+            bool(state.get("catch_canvas_drops", False))
+            if isinstance(state, dict)
+            else False
+        ),
+        "images_per_execution": images_per_execution,
+        "output_mode": output_mode,
+        "reference_slots": _normalize_reference_slots(
+            state.get("reference_slots", []) if isinstance(state, dict) else []
+        ),
+        "active_reference_preset_id": (
+            str(state.get("active_reference_preset_id", "")).strip()
+            if isinstance(state, dict)
+            else ""
+        ),
     }
+
+
+def _effective_images_per_execution(state: Dict[str, Any]) -> int:
+    if state.get("output_mode") == _OUTPUT_MODE_QUEUE_GROUP:
+        return _normalize_images_per_execution(state.get("images_per_execution", 1))
+    return 1
 
 
 def _normalize_ui_state(raw: Any) -> Dict[str, Any]:
     """
     Normalize a raw UI state payload into the expected runtime UI state structure.
-    
+
     Parameters:
         raw (Any): Raw UI state value, typically a JSON string or already-parsed object.
-    
+
     Returns:
         Dict[str, Any]: Normalized UI state with keys:
             - `version` (int): Schema version (set to the module `_STATE_VERSION`).
@@ -116,8 +233,12 @@ def _normalize_ui_state(raw: Any) -> Dict[str, Any]:
             - `source_paths` (Dict[str, str]): Mapping of item ID to non-empty trimmed source path.
     """
     ui_state = _safe_json_load(raw, _default_ui_state())
-    selected_ids_raw = ui_state.get("selected_ids", []) if isinstance(ui_state, dict) else []
-    source_paths_raw = ui_state.get("source_paths", {}) if isinstance(ui_state, dict) else {}
+    selected_ids_raw = (
+        ui_state.get("selected_ids", []) if isinstance(ui_state, dict) else []
+    )
+    source_paths_raw = (
+        ui_state.get("source_paths", {}) if isinstance(ui_state, dict) else {}
+    )
     selected_ids: List[str] = []
     if isinstance(selected_ids_raw, list):
         selected_ids = [str(value) for value in selected_ids_raw if str(value).strip()]
@@ -137,42 +258,182 @@ def _normalize_ui_state(raw: Any) -> Dict[str, Any]:
     }
 
 
+def _normalize_queue_member(value: Any) -> Optional[Dict[str, str]]:
+    if not isinstance(value, dict):
+        return None
+    item_id = str(value.get("id", "")).strip()
+    annotated = str(value.get("annotated", "")).strip()
+    if not item_id or not annotated:
+        return None
+    return {"id": item_id, "annotated": annotated}
+
+
 def _parse_queue_item(raw: Any) -> Optional[Dict[str, Any]]:
-    """
-    Parse a queue payload and extract normalized `id` and `annotated` fields.
-    
-    Parameters:
-    	raw (Any): JSON string or object representing a queue payload containing `id` and `annotated`.
-    
-    Returns:
-    	result (Optional[Dict[str, str]]): A dict with keys `"id"` and `"annotated"` containing trimmed, non-empty string values when both are present; `None` if the payload is invalid or required fields are missing.
-    """
+    """Parse a legacy single-item or new ordered group prompt reservation."""
     payload = _safe_json_load(raw, {})
     if not isinstance(payload, dict):
         return None
 
-    item_id = str(payload.get("id", "")).strip()
-    annotated = str(payload.get("annotated", "")).strip()
-    if not item_id or not annotated:
+    if "items" in payload:
+        raw_items = payload.get("items")
+        if not isinstance(raw_items, list) or not raw_items:
+            raise RuntimeError(
+                "Image Conveyor: queued image group reservation is invalid."
+            )
+
+        items: List[Dict[str, str]] = []
+        seen_ids = set()
+        for raw_item in raw_items:
+            member = _normalize_queue_member(raw_item)
+            if member is None or member["id"] in seen_ids:
+                raise RuntimeError(
+                    "Image Conveyor: queued image group reservation is invalid."
+                )
+            seen_ids.add(member["id"])
+            items.append(member)
+
+        first = items[0]
+        top_level = _normalize_queue_member(payload)
+        if top_level is not None and top_level != first:
+            raise RuntimeError(
+                "Image Conveyor: queued image group reservation is inconsistent."
+            )
+        return {
+            "id": first["id"],
+            "annotated": first["annotated"],
+            "items": items,
+            "grouped": True,
+        }
+
+    item = _normalize_queue_member(payload)
+    if item is None:
         return None
     return {
-        "id": item_id,
-        "annotated": annotated,
+        "id": item["id"],
+        "annotated": item["annotated"],
+        "grouped": False,
     }
 
 
+def _main_output_enabled(state: Dict[str, Any], queue_item_json: Any) -> bool:
+    """Resolve the queued main-image enable snapshot for persistent-reference mode."""
+    if state.get("output_mode") != _OUTPUT_MODE_PERSISTENT:
+        return True
+    payload = _safe_json_load(queue_item_json, {})
+    if not isinstance(payload, dict) or _MAIN_OUTPUT_ENABLED_KEY not in payload:
+        # Legacy prompts predate this snapshot and always required a conveyor image.
+        return True
+    value = payload.get(_MAIN_OUTPUT_ENABLED_KEY)
+    if type(value) is not bool:
+        raise RuntimeError("Image Conveyor: main output enable snapshot is invalid.")
+    return value
+
+
+def _connected_queue_output_slots(
+    state: Dict[str, Any], queue_item_json: Any
+) -> Tuple[int, ...]:
+    """Resolve queue-driven output roles for this execution.
+
+    Persistent mode accepts only role 0 (image) and role 1 (last_frame). Newly
+    queued prompts carry this explicitly. Legacy prompts preserve their released
+    main-image-only behavior when the field is absent.
+
+    Queue-group mode keeps its released 1..9 grouping semantics; last_frame is an
+    additional alias of the second grouped image and does not change group size.
+    """
+    if state.get("output_mode") != _OUTPUT_MODE_PERSISTENT:
+        return tuple(range(_effective_images_per_execution(state)))
+
+    payload = _safe_json_load(queue_item_json, {})
+    if isinstance(payload, dict) and _QUEUE_OUTPUT_SLOTS_KEY in payload:
+        raw_slots = payload.get(_QUEUE_OUTPUT_SLOTS_KEY)
+        if not isinstance(raw_slots, list):
+            raise RuntimeError(
+                "Image Conveyor: queue output connection snapshot is invalid."
+            )
+
+        slots: List[int] = []
+        seen = set()
+        for raw_slot in raw_slots:
+            if (
+                isinstance(raw_slot, bool)
+                or not isinstance(raw_slot, int)
+                or raw_slot < _QUEUE_SLOT_IMAGE
+                or raw_slot > _QUEUE_SLOT_LAST_FRAME
+                or raw_slot in seen
+            ):
+                raise RuntimeError(
+                    "Image Conveyor: queue output connection snapshot is invalid."
+                )
+            seen.add(raw_slot)
+            slots.append(raw_slot)
+        if slots != sorted(slots):
+            raise RuntimeError(
+                "Image Conveyor: queue output connection snapshot is invalid."
+            )
+        return tuple(slots)
+
+    return (_QUEUE_SLOT_IMAGE,) if _main_output_enabled(state, queue_item_json) else ()
+
+
+def _requested_queue_image_count(state: Dict[str, Any], queue_item_json: Any) -> int:
+    return len(_connected_queue_output_slots(state, queue_item_json))
+
+
+def _connected_reference_slots(queue_item_json: Any) -> Optional[Tuple[int, ...]]:
+    """Return the queued 1-based reference-output snapshot, or None for legacy prompts."""
+    payload = _safe_json_load(queue_item_json, {})
+    if not isinstance(payload, dict) or _REFERENCE_OUTPUT_SLOTS_KEY not in payload:
+        return None
+
+    raw_slots = payload.get(_REFERENCE_OUTPUT_SLOTS_KEY)
+    if not isinstance(raw_slots, list):
+        raise RuntimeError(
+            "Image Conveyor: reference output connection snapshot is invalid."
+        )
+
+    slots: List[int] = []
+    seen = set()
+    for raw_slot in raw_slots:
+        if (
+            isinstance(raw_slot, bool)
+            or not isinstance(raw_slot, int)
+            or raw_slot < 1
+            or raw_slot > _REFERENCE_SLOT_COUNT
+            or raw_slot in seen
+        ):
+            raise RuntimeError(
+                "Image Conveyor: reference output connection snapshot is invalid."
+            )
+        seen.add(raw_slot)
+        slots.append(raw_slot)
+
+    if slots != sorted(slots):
+        raise RuntimeError(
+            "Image Conveyor: reference output connection snapshot is invalid."
+        )
+    return tuple(slots)
+
+
+def _active_reference_slots(
+    state: Dict[str, Any], queue_item_json: Any
+) -> Tuple[int, ...]:
+    """Resolve reference outputs used by this queued persistent-mode execution."""
+    if state.get("output_mode") != _OUTPUT_MODE_PERSISTENT:
+        return ()
+    connected = _connected_reference_slots(queue_item_json)
+    if connected is not None:
+        return connected
+    # Prompts queued by older frontend builds have no topology snapshot. Preserve
+    # their released behavior instead of silently dropping every reference.
+    return tuple(range(1, _REFERENCE_SLOT_COUNT + 1))
+
+
 def _get_runtime_source_path(ui_state: Dict[str, Any], item: Dict[str, Any]) -> str:
-    """
-    Resolve the runtime source path for an item, preferring a UI-provided override when present.
-    
-    Parameters:
-        ui_state (dict): UI state that may contain a `source_paths` mapping of item IDs to source path overrides.
-        item (dict): Item dictionary containing at least an `"id"` key and an optional `"source_path"` fallback.
-    
-    Returns:
-        str: The trimmed source path from `ui_state["source_paths"][item["id"]]` if non-empty, otherwise the trimmed `item["source_path"]` (or an empty string if neither is set).
-    """
-    source_paths = ui_state.get("source_paths", {}) if isinstance(ui_state, dict) else {}
+    """Resolve the runtime source path, preferring the UI-only source-path override."""
+    source_paths = (
+        ui_state.get("source_paths", {}) if isinstance(ui_state, dict) else {}
+    )
     if isinstance(source_paths, dict):
         source_path = str(source_paths.get(item["id"], "")).strip()
         if source_path:
@@ -180,21 +441,92 @@ def _get_runtime_source_path(ui_state: Dict[str, Any], item: Dict[str, Any]) -> 
     return str(item.get("source_path", "")).strip()
 
 
-def _find_item_by_id(state: Dict[str, Any], item_id: str) -> Tuple[int, Optional[Dict[str, Any]]]:
-    """
-    Locate an item in the given state by its `id` and return its index and the item.
-    
-    Parameters:
-    	state (Dict[str, Any]): Normalized state dictionary containing an "items" list of item dicts.
-    	item_id (str): The `id` value to search for.
-    
-    Returns:
-    	tuple: A pair `(index, item)` where `index` is the zero-based index of the matching item or `-1` if not found, and `item` is the matching item dictionary or `None` if not found.
-    """
+def _find_item_by_id(
+    state: Dict[str, Any], item_id: str
+) -> Tuple[int, Optional[Dict[str, Any]]]:
+    """Locate a queue item by its logical queue-entry ID."""
     for index, item in enumerate(state["items"]):
         if item["id"] == item_id:
             return index, item
     return -1, None
+
+
+def _insufficient_group_error(requested: int, available: int) -> RuntimeError:
+    return RuntimeError(
+        f"Image Conveyor: {requested} images per execution requested, "
+        f"but only {available} eligible queue images are available."
+    )
+
+
+def _select_group(
+    state: Dict[str, Any],
+    queue_item_json: Any,
+    *,
+    allow_processed: bool = False,
+) -> List[Tuple[int, Dict[str, Any]]]:
+    """Resolve one complete ordered execution group from reservation or queue state."""
+    count = _requested_queue_image_count(state, queue_item_json)
+    if count == 0:
+        return []
+    reservation = _parse_queue_item(queue_item_json)
+
+    if reservation is not None and reservation.get("grouped"):
+        reserved_items = reservation["items"]
+        if len(reserved_items) != count:
+            raise RuntimeError(
+                f"Image Conveyor: queued image group contains {len(reserved_items)} images, "
+                f"but this prompt requests {count}."
+            )
+
+        selected: List[Tuple[int, Dict[str, Any]]] = []
+        for reserved in reserved_items:
+            index, item = _find_item_by_id(state, reserved["id"])
+            if item is None:
+                raise RuntimeError(
+                    f"Image Conveyor: reserved queue image '{reserved['id']}' is no longer present."
+                )
+            if item["annotated"] != reserved["annotated"]:
+                raise RuntimeError(
+                    f"Image Conveyor: reserved queue image '{reserved['id']}' changed after it was queued."
+                )
+            selected.append((index, item))
+        return selected
+
+    if reservation is not None:
+        if count != 1:
+            raise RuntimeError(
+                "Image Conveyor: a legacy single-image reservation cannot satisfy "
+                f"{count} images per execution. Queue this prompt again."
+            )
+
+        index, item = _find_item_by_id(state, reservation["id"])
+        if item is not None:
+            return [(index, item)]
+        for idx, candidate in enumerate(state["items"]):
+            if candidate["annotated"] == reservation["annotated"]:
+                return [(idx, candidate)]
+
+    eligible = [
+        (idx, item)
+        for idx, item in enumerate(state["items"])
+        if item["status"] in {"pending", "queued"}
+    ]
+    if eligible:
+        if len(eligible) < count:
+            raise _insufficient_group_error(count, len(eligible))
+        return eligible[:count]
+
+    if allow_processed and state["items"]:
+        if len(state["items"]) < count:
+            raise _insufficient_group_error(count, len(state["items"]))
+        return list(enumerate(state["items"][:count]))
+
+    if count > 1:
+        raise _insufficient_group_error(count, 0)
+    raise RuntimeError(
+        "Image Conveyor: no pending or queued images are available. "
+        "Add images or reset items back to pending."
+    )
 
 
 def _select_item(
@@ -203,40 +535,93 @@ def _select_item(
     *,
     allow_processed: bool = False,
 ) -> Tuple[int, Dict[str, Any]]:
-    queued_item = _parse_queue_item(queue_item_json)
-    if queued_item is not None:
-        index, item = _find_item_by_id(state, queued_item["id"])
-        if item is not None:
-            return index, item
-        for idx, candidate in enumerate(state["items"]):
-            if candidate["annotated"] == queued_item["annotated"]:
-                return idx, candidate
+    """Compatibility wrapper preserving the released single-item selection helper."""
+    single_state = dict(state)
+    single_state["images_per_execution"] = 1
+    return _select_group(
+        single_state, queue_item_json, allow_processed=allow_processed
+    )[0]
 
-    for idx, item in enumerate(state["items"]):
-        if item["status"] in {"pending", "queued"}:
-            return idx, item
 
-    if allow_processed and state["items"]:
-        return 0, state["items"][0]
-
-    raise RuntimeError(
-        "Image Conveyor: no pending or queued images are available. "
-        "Add images or reset items back to pending."
+def _unresolved_change_hash(state: Dict[str, Any], reason: str) -> str:
+    """Return a stable cache sentinel while input validation reports the real error."""
+    identity = (
+        f"unresolved|output_mode={state['output_mode']}|"
+        f"images_per_execution={_effective_images_per_execution(state)}|{reason}"
     )
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def _hash_annotated_file(hasher: Any, annotated: str) -> bool:
+    """Update a digest with an annotated file; return False if it is missing."""
+    try:
+        path = folder_paths.get_annotated_filepath(annotated)
+        with open(path, "rb") as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+    except FileNotFoundError:
+        return False
+    return True
 
 
 class ImageConveyor:
     CATEGORY = "image"
     FUNCTION = "load_next"
     HAS_INTERMEDIATE_OUTPUT = True
-    RETURN_TYPES = ("IMAGE", "MASK", "STRING", "INT", "INT", "STRING","STRING","STRING","INT","INT","INT","INT","INT","INT","STRING")
+    RETURN_TYPES = (
+        "IMAGE",
+        "MASK",
+        "STRING",
+        "INT",
+        "INT",
+        "STRING",
+        "STRING",
+        "STRING",
+        "INT",
+        "INT",
+        "INT",
+        "INT",
+        "INT",
+        "INT",
+        "STRING",
+        "IMAGE",
+        "IMAGE",
+        "IMAGE",
+        "IMAGE",
+        "IMAGE",
+        "IMAGE",
+        "IMAGE",
+        "IMAGE",
+        "IMAGE",
+    )
     RETURN_NAMES = (
         "image",
         "mask",
         "path",
         "index",
         "remaining_pending",
-        "source_path","filename","format","dpi","width","height","long_edge","short_edge","file_size","exif"
+        "source_path",
+        "filename",
+        "format",
+        "dpi",
+        "width",
+        "height",
+        "long_edge",
+        "short_edge",
+        "file_size",
+        "exif",
+        "ref_image_1",
+        "ref_image_2",
+        "ref_image_3",
+        "ref_image_4",
+        "ref_image_5",
+        "ref_image_6",
+        "ref_image_7",
+        "ref_image_8",
+        "last_frame",
     )
     SEARCH_ALIASES = [
         "image conveyor",
@@ -253,7 +638,10 @@ class ImageConveyor:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "keep_alpha_channel": ("BOOLEAN", {"default": False, "label_on": "enabled", "label_off": "disabled"}),
+                "keep_alpha_channel": (
+                    "BOOLEAN",
+                    {"default": False, "label_on": "enabled", "label_off": "disabled"},
+                ),
                 "state_json": (
                     "STRING",
                     {
@@ -264,7 +652,9 @@ class ImageConveyor:
                 "ui_state_json": (
                     "STRING",
                     {
-                        "default": json.dumps(_default_ui_state(), separators=(",", ":")),
+                        "default": json.dumps(
+                            _default_ui_state(), separators=(",", ":")
+                        ),
                         "multiline": False,
                     },
                 ),
@@ -279,190 +669,326 @@ class ImageConveyor:
         }
 
     @classmethod
-    def IS_CHANGED(cls, state_json: Any, ui_state_json: Any = "", queue_item_json: Any = ""):
+    def IS_CHANGED(
+        cls, state_json: Any, ui_state_json: Any = "", queue_item_json: Any = ""
+    ):
         del ui_state_json
         state = _normalize_state(state_json)
-        if not state["items"]:
-            return hashlib.sha256(str(state_json).encode("utf-8")).hexdigest()
+        try:
+            queue_output_slots = _connected_queue_output_slots(state, queue_item_json)
+            active_reference_slots = _active_reference_slots(state, queue_item_json)
+        except RuntimeError as exc:
+            return _unresolved_change_hash(state, f"snapshot|{exc}")
 
-        index, item = _select_item(
-            state, queue_item_json, allow_processed=state["dont_consume"]
-        )
-        path = folder_paths.get_annotated_filepath(item["annotated"])
+        requested_count = len(queue_output_slots)
+        if requested_count > 0 and not state["items"]:
+            empty_identity = (
+                f"{state_json}|output_mode={state['output_mode']}|"
+                f"images_per_execution={_effective_images_per_execution(state)}|"
+                f"queue_outputs={','.join(map(str, queue_output_slots))}"
+            )
+            return hashlib.sha256(empty_identity.encode("utf-8")).hexdigest()
+
+        selected: List[Tuple[int, Dict[str, Any]]] = []
+        if requested_count > 0:
+            try:
+                selected = _select_group(
+                    state, queue_item_json, allow_processed=state["dont_consume"]
+                )
+            except RuntimeError as exc:
+                return _unresolved_change_hash(state, f"selection|{exc}")
 
         hasher = hashlib.sha256()
         hasher.update(b"dont_consume=1" if state["dont_consume"] else b"dont_consume=0")
-        hasher.update(str(index).encode("utf-8"))
-        hasher.update(item["id"].encode("utf-8"))
-        hasher.update(item["annotated"].encode("utf-8"))
-        with open(path, "rb") as handle:
-            hasher.update(handle.read())
+        hasher.update(f"|output_mode={state['output_mode']}".encode("utf-8"))
+        hasher.update(
+            f"|images_per_execution={_effective_images_per_execution(state)}".encode(
+                "utf-8"
+            )
+        )
+        hasher.update(
+            ("|queue_outputs=" + ",".join(map(str, queue_output_slots))).encode("utf-8")
+        )
+        for slot, (index, item) in enumerate(selected, start=1):
+            hasher.update(f"|slot={slot}|index={index}|".encode("utf-8"))
+            hasher.update(item["id"].encode("utf-8"))
+            hasher.update(b"|")
+            hasher.update(item["annotated"].encode("utf-8"))
+            if not _hash_annotated_file(hasher, item["annotated"]):
+                return _unresolved_change_hash(
+                    state,
+                    f"missing|slot={slot}|index={index}|id={item['id']}|annotated={item['annotated']}",
+                )
+
+        if state["output_mode"] == _OUTPUT_MODE_PERSISTENT:
+            hasher.update(
+                (
+                    "|reference_outputs=" + ",".join(map(str, active_reference_slots))
+                ).encode("utf-8")
+            )
+            for slot in active_reference_slots:
+                reference = state["reference_slots"][slot - 1]
+                if reference is None:
+                    hasher.update(f"|reference_slot={slot}|empty".encode("utf-8"))
+                    continue
+                hasher.update(f"|reference_slot={slot}|".encode("utf-8"))
+                hasher.update(reference["annotated"].encode("utf-8"))
+                if not _hash_annotated_file(hasher, reference["annotated"]):
+                    return _unresolved_change_hash(
+                        state,
+                        f"missing-reference|slot={slot}|annotated={reference['annotated']}",
+                    )
         return hasher.hexdigest()
 
     @classmethod
-    def VALIDATE_INPUTS(cls, state_json: Any, ui_state_json: Any = "", queue_item_json: Any = ""):
-        """
-        Validate that a selectable image item exists in the provided state and that its annotated file exists.
-        
-        Parameters:
-        	state_json (Any): Serialized node state or raw state structure to validate.
-        	queue_item_json (Any): Optional queue payload used to select a specific item (e.g., `{"id": "...", "annotated": "..."}`).
-        
-        Returns:
-        	True on successful validation.
-        	str: An error message when validation fails. Possible messages:
-        		"Image Conveyor: no images have been added to the node." — when the state contains no items.
-        		Contents of the selection error (from `_select_item`) — when item selection fails.
-        		"Image Conveyor: missing file '<path>'." — when the selected item's annotated file is not found.
-        """
+    def VALIDATE_INPUTS(
+        cls, state_json: Any, ui_state_json: Any = "", queue_item_json: Any = ""
+    ):
         del ui_state_json
         state = _normalize_state(state_json)
-        if not state["items"]:
-            return "Image Conveyor: no images have been added to the node."
-
         try:
-            _index, item = _select_item(
-                state, queue_item_json, allow_processed=state["dont_consume"]
-            )
+            queue_output_slots = _connected_queue_output_slots(state, queue_item_json)
+            active_reference_slots = _active_reference_slots(state, queue_item_json)
         except RuntimeError as exc:
             return str(exc)
 
-        if not folder_paths.exists_annotated_filepath(item["annotated"]):
-            return f"Image Conveyor: missing file '{item['annotated']}'."
+        selected: List[Tuple[int, Dict[str, Any]]] = []
+        if queue_output_slots:
+            if not state["items"]:
+                return "Image Conveyor: no images have been added to the node."
+            try:
+                selected = _select_group(
+                    state, queue_item_json, allow_processed=state["dont_consume"]
+                )
+            except RuntimeError as exc:
+                return str(exc)
+
+        for _index, item in selected:
+            if not folder_paths.exists_annotated_filepath(item["annotated"]):
+                return f"Image Conveyor: missing file '{item['annotated']}'."
+
+        if state["output_mode"] == _OUTPUT_MODE_PERSISTENT:
+            for slot in active_reference_slots:
+                reference = state["reference_slots"][slot - 1]
+                if reference is None:
+                    continue
+                if not folder_paths.exists_annotated_filepath(reference["annotated"]):
+                    return (
+                        f"Image Conveyor: reference slot {slot} is missing "
+                        f"'{reference['annotated']}'."
+                    )
 
         return True
 
-    def load_next(self,keep_alpha_channel, state_json: Any, ui_state_json: Any = "", queue_item_json: Any = ""):
-        """
-        Load the next selected image, compute remaining pending count, and produce a UI state delta.
-        
-        Parameters:
-            state_json (Any): Serialized node state (will be normalized) containing the list of items.
-            ui_state_json (Any): Serialized UI state (will be normalized); used to resolve the runtime source path for the selected item.
-            queue_item_json (Any): Optional queue payload that can influence which item is selected.
-        
-        Returns:
-            dict: A mapping with two keys:
-                - "result": A tuple containing:
-                    - image: The loaded image object.
-                    - mask: The loaded mask object (may be None).
-                    - annotated (str): The resolved annotated file path that was loaded.
-                    - index (int): 1-based index of the selected item within the state list.
-                    - remaining_pending (int): Number of other items in the state whose status is "pending".
-                    - source_path (str): The resolved runtime source path for the selected item (prefers UI override).
-                - "ui": A dict with key "batch_image_loader_delta" whose value is a single-item list containing a JSON string of the delta object with fields:
-                    - version: State schema version.
-                    - processed_item_id: ID of the processed item.
-                    - processed_annotated: Annotated path of the processed item.
-                    - new_status: The new status applied ("processed").
-        """
+    def load_next(
+        self,
+        keep_alpha_channel: bool,
+        state_json: Any,
+        ui_state_json: Any = "",
+        queue_item_json: Any = "",
+    ):
         state = _normalize_state(state_json)
         ui_state = _normalize_ui_state(ui_state_json)
         dont_consume = state["dont_consume"]
-        index, item = _select_item(
-            state, queue_item_json, allow_processed=dont_consume
+        queue_output_slots = _connected_queue_output_slots(state, queue_item_json)
+        active_reference_slots = _active_reference_slots(state, queue_item_json)
+        selected = (
+            _select_group(state, queue_item_json, allow_processed=dont_consume)
+            if queue_output_slots
+            else []
         )
 
-        annotated = item["annotated"]
-        source_path = _get_runtime_source_path(ui_state, item)
-        image, mask = nodes.LoadImage().load_image(annotated)
+        loader = nodes.LoadImage()
+        loaded_selected: List[Tuple[int, Dict[str, Any], Any, Any]] = []
+        for index, item in selected:
+            image, mask = loader.load_image(item["annotated"])
+            loaded_selected.append((index, item, image, mask))
 
-        image_path = folder_paths.get_annotated_filepath(annotated)
-        image_name, image_format = os.path.splitext(os.path.basename(image_path))
-        image_format = image_format[1:] or 'png'
-        image_file_size = os.path.getsize(image_path)
+        main_image = None
+        main_mask = None
+        annotated = ""
+        output_index = 0
+        source_path = ""
+        last_frame = None
+        long_edge = 0
+        short_edge = 0
+        dpi = 0
+        exif_data = None
+        width = 0
+        height = 0
+        image_file_size = 0
+        image_name = None
 
-        img = node_helpers.pillow(Image.open, image_path)
+        if state["output_mode"] == _OUTPUT_MODE_PERSISTENT:
+            for queue_slot, (index, item, image, mask) in zip(
+                queue_output_slots, loaded_selected
+            ):
+                if queue_slot == _QUEUE_SLOT_IMAGE:
+                    main_image = image
+                    main_mask = mask
+                    annotated = item["annotated"]
+                    output_index = index + 1
+                    source_path = _get_runtime_source_path(ui_state, item)
 
-        output_images = []
-        output_masks = []
-        w, h = None, None
+                    image_path = folder_paths.get_annotated_filepath(annotated)
+                    image_name, image_format = os.path.splitext(
+                        os.path.basename(image_path)
+                    )
+                    image_format = image_format[1:] or "png"
+                    image_file_size = os.path.getsize(image_path)
 
-        excluded_formats = ['MPO']
+                    img = node_helpers.pillow(Image.open, image_path)
 
-        for i in ImageSequence.Iterator(img):
-            i = node_helpers.pillow(ImageOps.exif_transpose, i)
+                    output_images = []
+                    output_masks = []
+                    w, h = None, None
 
-            if i.mode == 'I':
-                i = i.point(lambda pixel: pixel * (1 / 255))
+                    excluded_formats = ["MPO"]
 
-            has_alpha = "A" in i.getbands()
-            if has_alpha and keep_alpha_channel:
-                image_a = i.convert("RGBA")
-            else:
-                image_a = i.convert("RGB")
+                    for i in ImageSequence.Iterator(img):
+                        i = node_helpers.pillow(ImageOps.exif_transpose, i)
 
-            if len(output_images) == 0:
-                w = image_a.size[0]
-                h = image_a.size[1]
+                        # 如果是索引模式下则判断info信息里是否有透明字段，如果有则转换为RGBA
+                        if "A" not in i.getbands() and i.mode == "P":
+                            if "transparency" in i.info:
+                                i = i.convert("RGBA")
 
-            if image_a.size[0] != w or image_a.size[1] != h:
-                continue
+                        if i.mode == "I":
+                            i = i.point(lambda pixel: pixel * (1 / 255))
 
-            image_a = np.array(image_a).astype(np.float32) / 255.0
-            image_a = torch.from_numpy(image_a)[None, ]
-            if 'A' in i.getbands():
-                mask_a = np.array(i.getchannel('A')).astype(np.float32) / 255.0
-                mask_a = 1. - torch.from_numpy(mask_a)
-            else:
-                mask_a = torch.zeros((64, 64), dtype=torch.float32, device="cpu")
-            output_images.append(image_a)
-            output_masks.append(mask_a.unsqueeze(0))
+                        has_alpha = "A" in i.getbands()
+                        print("has_alpha", has_alpha)
+                        if has_alpha and keep_alpha_channel:
+                            image_a = i.convert("RGBA")
+                        else:
+                            image_a = i.convert("RGB")
 
-        if len(output_images) > 1 and img.format not in excluded_formats:
-            output_image = torch.cat(output_images, dim=0)
-            output_mask = torch.cat(output_masks, dim=0)
-        else:
-            output_image = output_images[0]
-            output_mask = output_masks[0]
+                        if len(output_images) == 0:
+                            w = image_a.size[0]
+                            h = image_a.size[1]
 
-        # 获取图像基本信息
-        width, height = img.size
-        long_edge = max(width, height)
-        short_edge = min(width, height)
-        
-        # 获取DPI信息
-        try:
-            dpi = img.info.get('dpi', (96, 96))[0]
-        except:
-            dpi = 0
-        
-        # 获取EXIF信息
-        exif_data = {}
-        try:
-            exif = {ExifTags.TAGS[k]: v for k, v in img.getexif().items() if k in ExifTags.TAGS} if img.getexif() else {}
-            for key, value in exif.items():
-                if isinstance(value, bytes):
+                        if image_a.size[0] != w or image_a.size[1] != h:
+                            continue
+
+                        image_a = np.array(image_a).astype(np.float32) / 255.0
+                        image_a = torch.from_numpy(image_a)[None,]
+                        if "A" in i.getbands():
+                            mask_a = (
+                                np.array(i.getchannel("A")).astype(np.float32) / 255.0
+                            )
+                            mask_a = 1.0 - torch.from_numpy(mask_a)
+                        else:
+                            mask_a = torch.zeros(
+                                (64, 64), dtype=torch.float32, device="cpu"
+                            )
+                        output_images.append(image_a)
+                        output_masks.append(mask_a.unsqueeze(0))
+
+                    if len(output_images) > 1 and img.format not in excluded_formats:
+                        main_image = torch.cat(output_images, dim=0)
+                        main_mask = torch.cat(output_masks, dim=0)
+                    else:
+                        main_image = output_images[0]
+                        main_mask = output_masks[0]
+
+                    # 获取图像基本信息
+                    width, height = img.size
+                    long_edge = max(width, height)
+                    short_edge = min(width, height)
+
+                    # 获取DPI信息
                     try:
-                        exif_data[key] = value.decode('utf-8')
+                        dpi = img.info.get("dpi", (96, 96))[0]
                     except:
-                        exif_data[key] = str(value)
-                else:
-                    exif_data[key] = str(value)
-        except:
-            pass
+                        dpi = 0
 
-        remaining_pending = 0
-        for idx, candidate in enumerate(state["items"]):
-            if not dont_consume and idx == index:
-                continue
-            if candidate["status"] == "pending":
-                remaining_pending += 1
+                    # 获取EXIF信息
+                    exif_data = {}
+                    try:
+                        exif = (
+                            {
+                                ExifTags.TAGS[k]: v
+                                for k, v in img.getexif().items()
+                                if k in ExifTags.TAGS
+                            }
+                            if img.getexif()
+                            else {}
+                        )
+                        for key, value in exif.items():
+                            if isinstance(value, bytes):
+                                try:
+                                    exif_data[key] = value.decode("utf-8")
+                                except:
+                                    exif_data[key] = str(value)
+                            else:
+                                exif_data[key] = str(value)
+                    except:
+                        pass
 
-        delta = {
-            "version": _STATE_VERSION,
-            "processed_item_id": item["id"],
-            "processed_annotated": annotated,
-            "new_status": "processed",
-            "consumed": not dont_consume,
-        }
+                elif queue_slot == _QUEUE_SLOT_LAST_FRAME:
+                    last_frame = image
 
+            additional_images = [None] * _REFERENCE_SLOT_COUNT
+            reference_cache: Dict[str, Any] = {}
+            for slot in active_reference_slots:
+                reference = state["reference_slots"][slot - 1]
+                if reference is None:
+                    continue
+                annotated_reference = reference["annotated"]
+                if annotated_reference not in reference_cache:
+                    image, _mask = loader.load_image(annotated_reference)
+                    reference_cache[annotated_reference] = image
+                additional_images[slot - 1] = reference_cache[annotated_reference]
+        else:
+            loaded_images = [entry[2] for entry in loaded_selected]
+            loaded_masks = [entry[3] for entry in loaded_selected]
+            if loaded_selected:
+                first_index, first_item, main_image, _mask = loaded_selected[0]
+                main_mask = loaded_masks[0]
+                annotated = first_item["annotated"]
+                output_index = first_index + 1
+                source_path = _get_runtime_source_path(ui_state, first_item)
+            # Preserve released queue-group reference mapping. last_frame is an
+            # additional alias of the second grouped image rather than shifting
+            # ref_image_1..8 or reducing their established capacity.
+            last_frame = loaded_images[1] if len(loaded_images) > 1 else None
+            additional_images = loaded_images[1:] + [None] * (
+                _MAX_IMAGES_PER_EXECUTION - len(loaded_images)
+            )
+
+        selected_ids = {item["id"] for _index, item in selected}
+        remaining_pending = sum(
+            1
+            for item in state["items"]
+            if item["status"] == "pending"
+            and (dont_consume or item["id"] not in selected_ids)
+        )
+
+        delta = None
+        if selected:
+            _first_selected_index, first_selected_item = selected[0]
+            processed_items = [
+                {"id": item["id"], "annotated": item["annotated"]}
+                for _index, item in selected
+            ]
+            delta = {
+                "version": _STATE_VERSION,
+                "processed_item_id": first_selected_item["id"],
+                "processed_annotated": first_selected_item["annotated"],
+                "processed_items": processed_items,
+                "new_status": "processed",
+                "consumed": not dont_consume,
+            }
+
+        ui = {}
+        if delta is not None:
+            ui["batch_image_loader_delta"] = [json.dumps(delta, separators=(",", ":"))]
         return {
             "result": (
-                output_image,
-                output_mask,
+                main_image,
+                main_mask,
                 annotated,
-                index + 1,
+                output_index,
                 remaining_pending,
                 source_path,
                 image_name,
@@ -473,11 +999,11 @@ class ImageConveyor:
                 long_edge,
                 short_edge,
                 image_file_size,
-                exif_data
+                exif_data,
+                *additional_images,
+                last_frame,
             ),
-            "ui": {
-                "batch_image_loader_delta": [json.dumps(delta, separators=(",", ":"))],
-            },
+            "ui": ui,
         }
 
 
