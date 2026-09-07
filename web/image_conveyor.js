@@ -1019,8 +1019,7 @@ function getItemDisplayPath(item, uiState = null) {
  * @returns {string} The normalized input-relative subfolder, or an empty string for the input root.
  */
 function buildUploadSubfolder(relativeSubfolder = '') {
-  const normalized = normalizeRelativeSubfolder(relativeSubfolder)
-  return normalized ? `${DEFAULT_SUBFOLDER}/${normalized}` : DEFAULT_SUBFOLDER
+  return normalizeRelativeSubfolder(relativeSubfolder)
 }
 
 function normalizeUploadFiles(files) {

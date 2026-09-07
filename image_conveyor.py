@@ -24,15 +24,7 @@ _MAIN_OUTPUT_ENABLED_KEY = "main_output_enabled"
 _OUTPUT_MODE_PERSISTENT = "persistent_refs"
 _OUTPUT_MODE_QUEUE_GROUP = "queue_group"
 _SUPPORTED_IMAGE_EXTENSIONS = {
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".webp",
-    ".bmp",
-    ".gif",
-    ".tif",
-    ".tiff",
-    ".avif",
+    ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff", ".avif"
 }
 
 
@@ -127,7 +119,7 @@ def _normalize_reference_slot(value: Any) -> Optional[Dict[str, str]]:
     suffix = " [input]"
     if not annotated.endswith(suffix):
         return None
-    relative_path = annotated[: -len(suffix)].strip().replace("\\", "/")
+    relative_path = annotated[:-len(suffix)].strip().replace("\\", "/")
     posix = PurePosixPath(relative_path)
     windows = PureWindowsPath(relative_path)
     parts = relative_path.split("/")
@@ -189,17 +181,9 @@ def _normalize_state(raw: Any) -> Dict[str, Any]:
     return {
         "version": _STATE_VERSION,
         "items": items,
-        "auto_queue": (
-            bool(state.get("auto_queue", False)) if isinstance(state, dict) else False
-        ),
-        "dont_consume": (
-            bool(state.get("dont_consume", False)) if isinstance(state, dict) else False
-        ),
-        "catch_canvas_drops": (
-            bool(state.get("catch_canvas_drops", False))
-            if isinstance(state, dict)
-            else False
-        ),
+        "auto_queue": bool(state.get("auto_queue", False)) if isinstance(state, dict) else False,
+        "dont_consume": bool(state.get("dont_consume", False)) if isinstance(state, dict) else False,
+        "catch_canvas_drops": bool(state.get("catch_canvas_drops", False)) if isinstance(state, dict) else False,
         "images_per_execution": images_per_execution,
         "output_mode": output_mode,
         "reference_slots": _normalize_reference_slots(
@@ -277,27 +261,21 @@ def _parse_queue_item(raw: Any) -> Optional[Dict[str, Any]]:
     if "items" in payload:
         raw_items = payload.get("items")
         if not isinstance(raw_items, list) or not raw_items:
-            raise RuntimeError(
-                "Image Conveyor: queued image group reservation is invalid."
-            )
+            raise RuntimeError("Image Conveyor: queued image group reservation is invalid.")
 
         items: List[Dict[str, str]] = []
         seen_ids = set()
         for raw_item in raw_items:
             member = _normalize_queue_member(raw_item)
             if member is None or member["id"] in seen_ids:
-                raise RuntimeError(
-                    "Image Conveyor: queued image group reservation is invalid."
-                )
+                raise RuntimeError("Image Conveyor: queued image group reservation is invalid.")
             seen_ids.add(member["id"])
             items.append(member)
 
         first = items[0]
         top_level = _normalize_queue_member(payload)
         if top_level is not None and top_level != first:
-            raise RuntimeError(
-                "Image Conveyor: queued image group reservation is inconsistent."
-            )
+            raise RuntimeError("Image Conveyor: queued image group reservation is inconsistent.")
         return {
             "id": first["id"],
             "annotated": first["annotated"],
@@ -348,9 +326,7 @@ def _connected_queue_output_slots(
     if isinstance(payload, dict) and _QUEUE_OUTPUT_SLOTS_KEY in payload:
         raw_slots = payload.get(_QUEUE_OUTPUT_SLOTS_KEY)
         if not isinstance(raw_slots, list):
-            raise RuntimeError(
-                "Image Conveyor: queue output connection snapshot is invalid."
-            )
+            raise RuntimeError("Image Conveyor: queue output connection snapshot is invalid.")
 
         slots: List[int] = []
         seen = set()
@@ -362,15 +338,11 @@ def _connected_queue_output_slots(
                 or raw_slot > _QUEUE_SLOT_LAST_FRAME
                 or raw_slot in seen
             ):
-                raise RuntimeError(
-                    "Image Conveyor: queue output connection snapshot is invalid."
-                )
+                raise RuntimeError("Image Conveyor: queue output connection snapshot is invalid.")
             seen.add(raw_slot)
             slots.append(raw_slot)
         if slots != sorted(slots):
-            raise RuntimeError(
-                "Image Conveyor: queue output connection snapshot is invalid."
-            )
+            raise RuntimeError("Image Conveyor: queue output connection snapshot is invalid.")
         return tuple(slots)
 
     return (_QUEUE_SLOT_IMAGE,) if _main_output_enabled(state, queue_item_json) else ()
@@ -388,9 +360,7 @@ def _connected_reference_slots(queue_item_json: Any) -> Optional[Tuple[int, ...]
 
     raw_slots = payload.get(_REFERENCE_OUTPUT_SLOTS_KEY)
     if not isinstance(raw_slots, list):
-        raise RuntimeError(
-            "Image Conveyor: reference output connection snapshot is invalid."
-        )
+        raise RuntimeError("Image Conveyor: reference output connection snapshot is invalid.")
 
     slots: List[int] = []
     seen = set()
@@ -402,22 +372,16 @@ def _connected_reference_slots(queue_item_json: Any) -> Optional[Tuple[int, ...]
             or raw_slot > _REFERENCE_SLOT_COUNT
             or raw_slot in seen
         ):
-            raise RuntimeError(
-                "Image Conveyor: reference output connection snapshot is invalid."
-            )
+            raise RuntimeError("Image Conveyor: reference output connection snapshot is invalid.")
         seen.add(raw_slot)
         slots.append(raw_slot)
 
     if slots != sorted(slots):
-        raise RuntimeError(
-            "Image Conveyor: reference output connection snapshot is invalid."
-        )
+        raise RuntimeError("Image Conveyor: reference output connection snapshot is invalid.")
     return tuple(slots)
 
 
-def _active_reference_slots(
-    state: Dict[str, Any], queue_item_json: Any
-) -> Tuple[int, ...]:
+def _active_reference_slots(state: Dict[str, Any], queue_item_json: Any) -> Tuple[int, ...]:
     """Resolve reference outputs used by this queued persistent-mode execution."""
     if state.get("output_mode") != _OUTPUT_MODE_PERSISTENT:
         return ()
@@ -431,9 +395,7 @@ def _active_reference_slots(
 
 def _get_runtime_source_path(ui_state: Dict[str, Any], item: Dict[str, Any]) -> str:
     """Resolve the runtime source path, preferring the UI-only source-path override."""
-    source_paths = (
-        ui_state.get("source_paths", {}) if isinstance(ui_state, dict) else {}
-    )
+    source_paths = ui_state.get("source_paths", {}) if isinstance(ui_state, dict) else {}
     if isinstance(source_paths, dict):
         source_path = str(source_paths.get(item["id"], "")).strip()
         if source_path:
@@ -441,9 +403,7 @@ def _get_runtime_source_path(ui_state: Dict[str, Any], item: Dict[str, Any]) -> 
     return str(item.get("source_path", "")).strip()
 
 
-def _find_item_by_id(
-    state: Dict[str, Any], item_id: str
-) -> Tuple[int, Optional[Dict[str, Any]]]:
+def _find_item_by_id(state: Dict[str, Any], item_id: str) -> Tuple[int, Optional[Dict[str, Any]]]:
     """Locate a queue item by its logical queue-entry ID."""
     for index, item in enumerate(state["items"]):
         if item["id"] == item_id:
@@ -538,9 +498,7 @@ def _select_item(
     """Compatibility wrapper preserving the released single-item selection helper."""
     single_state = dict(state)
     single_state["images_per_execution"] = 1
-    return _select_group(
-        single_state, queue_item_json, allow_processed=allow_processed
-    )[0]
+    return _select_group(single_state, queue_item_json, allow_processed=allow_processed)[0]
 
 
 def _unresolved_change_hash(state: Dict[str, Any], reason: str) -> str:
@@ -702,9 +660,7 @@ class ImageConveyor:
         hasher.update(b"dont_consume=1" if state["dont_consume"] else b"dont_consume=0")
         hasher.update(f"|output_mode={state['output_mode']}".encode("utf-8"))
         hasher.update(
-            f"|images_per_execution={_effective_images_per_execution(state)}".encode(
-                "utf-8"
-            )
+            f"|images_per_execution={_effective_images_per_execution(state)}".encode("utf-8")
         )
         hasher.update(
             ("|queue_outputs=" + ",".join(map(str, queue_output_slots))).encode("utf-8")
@@ -722,9 +678,7 @@ class ImageConveyor:
 
         if state["output_mode"] == _OUTPUT_MODE_PERSISTENT:
             hasher.update(
-                (
-                    "|reference_outputs=" + ",".join(map(str, active_reference_slots))
-                ).encode("utf-8")
+                ("|reference_outputs=" + ",".join(map(str, active_reference_slots))).encode("utf-8")
             )
             for slot in active_reference_slots:
                 reference = state["reference_slots"][slot - 1]
@@ -741,9 +695,7 @@ class ImageConveyor:
         return hasher.hexdigest()
 
     @classmethod
-    def VALIDATE_INPUTS(
-        cls, state_json: Any, ui_state_json: Any = "", queue_item_json: Any = ""
-    ):
+    def VALIDATE_INPUTS(cls, state_json: Any, ui_state_json: Any = "", queue_item_json: Any = ""):
         del ui_state_json
         state = _normalize_state(state_json)
         try:
